@@ -3,7 +3,7 @@ import copy
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -34,11 +34,28 @@ def parse_args() -> argparse.Namespace:
         description="Run BERT-style node classification baselines on citation/product datasets."
     )
     parser.add_argument(
+        "--root",
+        type=str,
+        default=None,
+        help="Optional dataset root. Supports custom datasets such as children/history/photo.",
+    )
+    parser.add_argument(
         "--datasets",
         nargs="+",
         default=["ogbn-arxiv", "cora", "pubmed", "amazon-photo"],
-        choices=["ogbn-arxiv", "cora", "pubmed", "amazon-photo"],
         help="Datasets to evaluate.",
+    )
+    parser.add_argument(
+        "--feature-types",
+        nargs="+",
+        default=["raw"],
+        help="Feature types to evaluate. For custom datasets, supports raw or plm.",
+    )
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=["bert"],
+        help="Accepted for compatibility with multi-model scripts. Only bert is used here.",
     )
     parser.add_argument("--runs", type=int, default=5, help="Repeated runs per dataset.")
     parser.add_argument("--epochs", type=int, default=20, help="Training epochs.")
@@ -49,7 +66,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.1, help="Classifier dropout.")
     parser.add_argument("--hidden-size", type=int, default=128, help="Transformer hidden size.")
     parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=None,
+        help="Alias of --hidden-size for compatibility with GNN-style scripts.",
+    )
+    parser.add_argument(
         "--num-hidden-layers", type=int, default=4, help="Number of transformer layers."
+    )
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=None,
+        help="Accepted for compatibility with GNN-style scripts. Ignored by this script.",
     )
     parser.add_argument(
         "--num-attention-heads", type=int, default=4, help="Number of attention heads."
@@ -74,7 +103,12 @@ def parse_args() -> argparse.Namespace:
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Training device.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.hidden_dim is not None:
+        args.hidden_size = args.hidden_dim
+    args.datasets = [dataset.lower() for dataset in args.datasets]
+    args.feature_types = [feature_type.lower() for feature_type in args.feature_types]
+    return args
 
 
 def set_seed(seed: int) -> None:
@@ -121,7 +155,106 @@ def stratified_split(
     return train_idx, val_idx, test_idx
 
 
-def load_dataset(name: str, root: Path, split_seed: int) -> DatasetBundle:
+def _find_existing_path(candidates: List[Path]) -> Optional[Path]:
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _title_case_dataset_name(name: str) -> str:
+    return {
+        "children": "Children",
+        "history": "History",
+        "photo": "Photo",
+    }.get(name, name)
+
+
+def _resolve_custom_dataset_paths(root: Path, name: str) -> Tuple[Path, Path]:
+    title_name = _title_case_dataset_name(name)
+    csv_path = _find_existing_path(
+        [
+            root / title_name / f"{title_name}.csv",
+            root / name / f"{name}.csv",
+            root / "CSTAG" / title_name / f"{title_name}.csv",
+            root / "CSTAG" / name / f"{name}.csv",
+        ]
+    )
+    if csv_path is None:
+        raise FileNotFoundError(f"Unable to locate csv for dataset '{name}' under {root}.")
+    dataset_dir = csv_path.parent
+    return dataset_dir, csv_path
+
+
+def _resolve_feature_path(root: Path, dataset_dir: Path, name: str, feature_type: str) -> Optional[Path]:
+    title_name = _title_case_dataset_name(name)
+    feature_type = feature_type.lower()
+    candidates: List[Path] = []
+    if feature_type == "plm":
+        candidates.extend(
+            [
+                root / "manual_features" / f"{name}_plm.npy",
+                root / "manual_features" / f"{title_name.lower()}_plm.npy",
+                root / "manual_features" / f"{title_name}_plm.npy",
+                dataset_dir / "Feature" / f"{title_name}_roberta_base_512_cls.npy",
+                dataset_dir / "Feature" / f"{name}_roberta_base_512_cls.npy",
+            ]
+        )
+    elif feature_type == "raw":
+        return None
+    else:
+        raise ValueError(f"Unsupported feature type '{feature_type}' for dataset '{name}'.")
+
+    feature_path = _find_existing_path(candidates)
+    if feature_path is None:
+        searched = ", ".join(str(candidate) for candidate in candidates)
+        raise FileNotFoundError(
+            f"Unable to locate feature file for dataset '{name}' and feature type '{feature_type}'. "
+            f"Searched: {searched}"
+        )
+    return feature_path
+
+
+def _load_custom_dataset(name: str, root: Path, split_seed: int, feature_type: str) -> DatasetBundle:
+    dataset_dir, csv_path = _resolve_custom_dataset_paths(root, name)
+    df = pd.read_csv(csv_path)
+    if "label" not in df.columns:
+        raise ValueError(f"Dataset csv is missing required 'label' column: {csv_path}")
+
+    feature_path = _resolve_feature_path(root, dataset_dir, name, feature_type)
+    if feature_path is None:
+        raise ValueError(
+            f"Dataset '{name}' does not contain built-in dense features. "
+            f"Please provide '--feature-types plm' with a valid .npy feature file."
+        )
+
+    x = torch.from_numpy(np.load(feature_path).astype(np.float32))
+    y = torch.from_numpy(df["label"].to_numpy()).long()
+
+    if x.size(0) != y.size(0):
+        raise ValueError(
+            f"Feature rows ({x.size(0)}) do not match label rows ({y.size(0)}) for dataset '{name}'."
+        )
+
+    train_idx, val_idx, test_idx = stratified_split(
+        y=y,
+        train_ratio=0.2,
+        val_ratio=0.2,
+        seed=split_seed,
+    )
+    return DatasetBundle(
+        name=f"{name}-{feature_type}",
+        x=x,
+        y=y,
+        train_idx=train_idx,
+        val_idx=val_idx,
+        test_idx=test_idx,
+        num_features=x.size(1),
+        num_classes=int(y.max().item()) + 1,
+    )
+
+
+def load_dataset(name: str, root: Path, split_seed: int, feature_type: str = "raw") -> DatasetBundle:
     if name == "ogbn-arxiv":
         dataset = PygNodePropPredDataset(name="ogbn-arxiv", root=str(root / "ogb"))
         data = dataset[0]
@@ -176,6 +309,9 @@ def load_dataset(name: str, root: Path, split_seed: int) -> DatasetBundle:
             num_features=dataset.num_features,
             num_classes=dataset.num_classes,
         )
+
+    if name in {"children", "history", "photo"}:
+        return _load_custom_dataset(name=name, root=root, split_seed=split_seed, feature_type=feature_type)
 
     raise ValueError(f"Unsupported dataset: {name}")
 
@@ -378,26 +514,28 @@ def train_one_run(
 def run_experiments(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame]:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    data_root = output_dir / "datasets"
+    data_root = Path(args.root) if args.root is not None else output_dir / "datasets"
 
     all_rows: List[Dict[str, float]] = []
 
-    for dataset_name in args.datasets:
-        for run in range(args.runs):
-            run_seed = args.seed + run
-            dataset = load_dataset(dataset_name, data_root, split_seed=run_seed)
-            metrics = train_one_run(dataset, args, run_seed=run_seed)
-            row = {
-                "dataset": dataset_name,
-                "run": run + 1,
-                "seed": run_seed,
-                **metrics,
-            }
-            all_rows.append(row)
+    for feature_type in args.feature_types:
+        for dataset_name in args.datasets:
+            for run in range(args.runs):
+                run_seed = args.seed + run
+                dataset = load_dataset(dataset_name, data_root, split_seed=run_seed, feature_type=feature_type)
+                metrics = train_one_run(dataset, args, run_seed=run_seed)
+                row = {
+                    "dataset": dataset_name,
+                    "feature_type": feature_type,
+                    "run": run + 1,
+                    "seed": run_seed,
+                    **metrics,
+                }
+                all_rows.append(row)
 
     run_df = pd.DataFrame(all_rows)
     summary_df = (
-        run_df.groupby("dataset")
+        run_df.groupby(["dataset", "feature_type"])
         .agg(
             runs=("run", "count"),
             test_acc_mean=("test_acc", "mean"),
